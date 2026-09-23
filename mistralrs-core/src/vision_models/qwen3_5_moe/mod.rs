@@ -48,6 +48,7 @@ pub struct Qwen3_5MoeModel {
     vision_start_token_id: u32,
     vision_end_token_id: u32,
     encoder_cache: Arc<Mutex<EncoderCacheManager>>,
+    is_sequence_classifier: bool,
 }
 
 impl Qwen3_5MoeModel {
@@ -75,10 +76,12 @@ impl Qwen3_5MoeModel {
         if cfg.quantization_config.is_some() {
             text_config.quantization_config = cfg.quantization_config.clone();
         }
+        let classification_num_labels = cfg.classification_num_labels()?;
         let text = Qwen3_5MoeTextModel::new(
             &text_config,
             vb.clone(),
             cfg.tie_word_embeddings,
+            classification_num_labels,
             normal_loading_metadata,
             attention_mechanism,
         )?;
@@ -91,6 +94,7 @@ impl Qwen3_5MoeModel {
             vision_start_token_id: cfg.vision_start_token_id,
             vision_end_token_id: cfg.vision_end_token_id,
             encoder_cache: Arc::new(Mutex::new(EncoderCacheManager::new(32))),
+            is_sequence_classifier: classification_num_labels.is_some(),
         })
     }
 
@@ -423,7 +427,7 @@ impl crate::block_diffusion::BlockDiffusionMixin for Qwen3_5MoeModel {}
 
 impl MultimodalModel for Qwen3_5MoeModel {
     fn supports_packed_prefill(&self) -> bool {
-        true
+        !self.is_sequence_classifier
     }
 
     fn supports_mixed_media_batches(&self) -> bool {

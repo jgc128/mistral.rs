@@ -1034,6 +1034,35 @@ impl<'a> ModelForwardContext<'a> {
         };
         selection.select(logits)
     }
+
+    pub(crate) fn last_hidden(&self, hidden_states: &Tensor) -> candle_core::Result<Tensor> {
+        if self.flash_params.packed {
+            candle_core::bail!("last-token pooling does not support packed prefill");
+        }
+        let (batch, seq_len, hidden) = hidden_states.dims3()?;
+        if self.context_lens.len() != batch {
+            candle_core::bail!(
+                "last-token pooling has {} spans for batch size {batch}",
+                self.context_lens.len()
+            );
+        }
+        let mut indices = Vec::with_capacity(batch * hidden);
+        for &(start, len) in self.context_lens {
+            let position = start
+                .checked_add(len)
+                .and_then(|end| end.checked_sub(1))
+                .ok_or_else(|| candle_core::Error::msg("cannot pool an empty sequence"))?;
+            if position >= seq_len {
+                candle_core::bail!(
+                    "last-token pooling position {position} exceeds sequence length {seq_len}"
+                );
+            }
+            let position = u32::try_from(position).map_err(candle_core::Error::wrap)?;
+            indices.extend(std::iter::repeat_n(position, hidden));
+        }
+        let indices = Tensor::from_vec(indices, (batch, 1, hidden), hidden_states.device())?;
+        hidden_states.gather(&indices, 1)?.squeeze(1)
+    }
 }
 
 pub(crate) fn text_positions_tensor(
@@ -1272,6 +1301,7 @@ pub enum SupportedModality {
     Vision,
     Video,
     Embedding,
+    Classification,
 }
 
 impl Debug for SupportedModality {
@@ -1282,6 +1312,7 @@ impl Debug for SupportedModality {
             Self::Vision => write!(f, "🖼️ Vision"),
             Self::Video => write!(f, "🎬 Video"),
             Self::Embedding => write!(f, "🔢 Embedding"),
+            Self::Classification => write!(f, "🏷️ Classification"),
         }
     }
 }
@@ -1482,6 +1513,7 @@ pub enum ModelCategory {
     Audio,
     Speech,
     Embedding,
+    Classification,
 }
 
 impl std::fmt::Debug for ModelCategory {
@@ -1495,6 +1527,7 @@ impl std::fmt::Debug for ModelCategory {
             ModelCategory::Audio => write!(f, "ModelCategory::Audio"),
             ModelCategory::Speech => write!(f, "ModelCategory::Speech"),
             ModelCategory::Embedding => write!(f, "ModelCategory::Embedding"),
+            ModelCategory::Classification => write!(f, "ModelCategory::Classification"),
         }
     }
 }
@@ -1508,13 +1541,15 @@ impl PartialEq for ModelCategory {
             (Self::Speech, Self::Speech) => true,
             (Self::Diffusion, Self::Diffusion) => true,
             (Self::Embedding, Self::Embedding) => true,
+            (Self::Classification, Self::Classification) => true,
             (
                 Self::Text
                 | Self::Multimodal { .. }
                 | Self::Diffusion
                 | Self::Audio
                 | Self::Speech
-                | Self::Embedding,
+                | Self::Embedding
+                | Self::Classification,
                 _,
             ) => false,
         }
@@ -3501,6 +3536,26 @@ mod tests {
         assert_eq!(
             selected.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             vec![1.0, 2.0, 3.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn last_hidden_pools_each_sequences_final_non_padding_token() {
+        let hidden_states = Tensor::from_vec(
+            (0u8..16).map(f32::from).collect::<Vec<_>>(),
+            (2, 4, 2),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let flash_params = FlashParams::empty(true);
+        let context =
+            ModelForwardContext::new(&[0, 0], &[(0, 4), (1, 2)], &[0, 0], None, &flash_params);
+        let pooled = context.last_hidden(&hidden_states).unwrap();
+
+        assert_eq!(pooled.dims(), &[2, 2]);
+        assert_eq!(
+            pooled.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![6.0, 7.0, 12.0, 13.0]
         );
     }
 

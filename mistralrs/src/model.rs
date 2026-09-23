@@ -13,6 +13,14 @@ use crate::{EmbeddingRequest, EmbeddingRequestBuilder, RequestLike, TextMessages
 // Re-export for convenience
 pub use mistralrs_core::{AddModelConfig, ModelStatus, Pipeline, SchedulerConfig};
 
+#[derive(Debug, Clone)]
+pub struct ClassificationResult {
+    pub label: &'static str,
+    pub label_index: usize,
+    pub logits: Vec<f32>,
+    pub probabilities: Vec<f32>,
+}
+
 /// Gets the best device, cpu, cuda if compiled with CUDA, or Metal
 pub fn best_device(force_cpu: bool) -> Result<Device> {
     if force_cpu {
@@ -111,6 +119,140 @@ impl futures::Stream for Stream<'_> {
 }
 
 impl Model {
+    /// Classify one OpenJEV premise/hypothesis pair.
+    ///
+    /// When `image` is set, `premise` must contain exactly one `{img}` marker.
+    pub async fn classify(
+        &self,
+        premise: impl AsRef<str>,
+        hypothesis: impl AsRef<str>,
+        image: Option<image::DynamicImage>,
+    ) -> crate::error::Result<ClassificationResult> {
+        self.classify_with_model(premise, hypothesis, image, None)
+            .await
+    }
+
+    /// Classify one OpenJEV pair with a specific loaded model.
+    pub async fn classify_with_model(
+        &self,
+        premise: impl AsRef<str>,
+        hypothesis: impl AsRef<str>,
+        image: Option<image::DynamicImage>,
+        model_id: Option<&str>,
+    ) -> crate::error::Result<ClassificationResult> {
+        const IMAGE_PLACEHOLDER: &str = "{img}";
+        const IMAGE_TOKENS: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+        const LABELS: [&str; 3] = ["contradiction", "entailment", "neutral"];
+
+        let premise = premise.as_ref();
+        let placeholder_count = premise.matches(IMAGE_PLACEHOLDER).count();
+        match &image {
+            Some(_) if placeholder_count != 1 => {
+                return Err(SdkError::RequestValidation(format!(
+                    "premise must contain exactly one `{IMAGE_PLACEHOLDER}` marker when image is set"
+                )));
+            }
+            None if placeholder_count != 0 => {
+                return Err(SdkError::RequestValidation(format!(
+                    "premise contains `{IMAGE_PLACEHOLDER}` but no image was provided"
+                )));
+            }
+            _ => {}
+        }
+        let premise = premise.replace(IMAGE_PLACEHOLDER, IMAGE_TOKENS);
+        let text = format!(
+            "Premise: {}\nHypothesis: {}",
+            premise.trim(),
+            hypothesis.as_ref().trim()
+        );
+        let (tx, mut rx) = channel(1);
+        let request = Request::Normal(Box::new(NormalRequest {
+            id: 0,
+            queued_at: None,
+            messages: RequestMessage::Classification {
+                text,
+                images: image.into_iter().collect(),
+            },
+            sampling_params: SamplingParams::deterministic(),
+            seed: None,
+            response: tx,
+            return_logprobs: false,
+            is_streaming: false,
+            suffix: None,
+            constraint: Constraint::None,
+            tool_choice: None,
+            tools: None,
+            logits_processors: None,
+            return_raw_logits: true,
+            web_search_options: None,
+            enable_code_execution: false,
+            enable_shell: false,
+            shell_options: None,
+            code_execution_permission: None,
+            code_execution_approval_notifier: None,
+            agent_permission: None,
+            agent_approval_handler: None,
+            agent_approval_notifier: None,
+            max_tool_rounds: None,
+            tool_dispatch_url: None,
+            model_id: model_id.map(str::to_string),
+            adapter: None,
+            truncate_sequence: false,
+            session_id: None,
+            files: None,
+            input_files: Vec::new(),
+        }));
+        self.runner.get_sender(model_id)?.send(request).await?;
+
+        let response = rx
+            .recv()
+            .await
+            .ok_or_else(|| SdkError::Channel("channel closed unexpectedly".into()))?
+            .as_result()?;
+        let ResponseOk::Raw { logits_chunks, .. } = response else {
+            return Err(SdkError::UnexpectedResponse { expected: "Raw" });
+        };
+        let logits = logits_chunks
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("classification returned no logits"))?
+            .to_dtype(candle_core::DType::F32)
+            .map_err(anyhow::Error::msg)?
+            .flatten_all()
+            .map_err(anyhow::Error::msg)?
+            .to_vec1::<f32>()
+            .map_err(anyhow::Error::msg)?;
+        if logits.len() != LABELS.len() {
+            return Err(anyhow::anyhow!(
+                "classification returned {} logits; expected {}",
+                logits.len(),
+                LABELS.len()
+            )
+            .into());
+        }
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut probabilities = logits
+            .iter()
+            .map(|logit| (*logit - max).exp())
+            .collect::<Vec<_>>();
+        let sum = probabilities.iter().sum::<f32>();
+        for probability in &mut probabilities {
+            *probability /= sum;
+        }
+        let label_index = probabilities
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| index)
+            .expect("classification probabilities are non-empty");
+
+        Ok(ClassificationResult {
+            label: LABELS[label_index],
+            label_index,
+            logits,
+            probabilities,
+        })
+    }
+
     /// Wrap an existing [`MistralRs`] engine instance.
     /// Prefer using a builder (e.g., [`ModelBuilder`](crate::ModelBuilder)) instead.
     pub fn new(runner: Arc<MistralRs>) -> Self {

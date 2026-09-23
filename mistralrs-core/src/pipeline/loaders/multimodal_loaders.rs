@@ -199,6 +199,13 @@ pub trait MultimodalModelLoader: IsqModelLoader + Send + Sync + DeviceMappedMode
         preprocessor_config: PreProcessorConfig,
         max_edge: Option<u32>,
     ) -> Arc<dyn Processor + Send + Sync>;
+    fn finalize_preprocessor_config(
+        &self,
+        _model_config: &str,
+        _preprocessor_config: &mut PreProcessorConfig,
+    ) -> Result<()> {
+        Ok(())
+    }
     fn supports_paged_attention(&self, config: &str) -> bool;
     fn supports_encoder_cache(&self, _config: &str) -> bool {
         false
@@ -342,7 +349,9 @@ impl MultimodalLoaderType {
             "Qwen3VLForConditionalGeneration" => Ok(Self::Qwen3VL),
             "Qwen3VLMoeForConditionalGeneration" => Ok(Self::Qwen3VLMoE),
             "Qwen3_5ForConditionalGeneration" => Ok(Self::Qwen3_5),
+            "Qwen3_5ForSequenceClassification" => Ok(Self::Qwen3_5),
             "Qwen3_5MoeForConditionalGeneration" => Ok(Self::Qwen3_5Moe),
+            "Qwen3_5MoeForSequenceClassification" => Ok(Self::Qwen3_5Moe),
             "VoxtralRealtimeForConditionalGeneration" => Ok(Self::Voxtral),
             other => anyhow::bail!(
                 "Unsupported Hugging Face Transformers -CausalLM model class `{other}`. Please raise an issue."
@@ -6946,6 +6955,23 @@ impl MultimodalModelLoader for Qwen3_5Loader {
     ) -> Arc<dyn Processor + Send + Sync> {
         Arc::new(Qwen3_5Processor::new(max_edge))
     }
+    fn finalize_preprocessor_config(
+        &self,
+        model_config: &str,
+        preprocessor_config: &mut PreProcessorConfig,
+    ) -> Result<()> {
+        let config: Qwen3_5Config = serde_json::from_str(model_config)?;
+        preprocessor_config.patch_size = preprocessor_config
+            .patch_size
+            .or(Some(config.vision_config.patch_size));
+        preprocessor_config.merge_size = preprocessor_config
+            .merge_size
+            .or(Some(config.vision_config.spatial_merge_size));
+        preprocessor_config.temporal_patch_size = preprocessor_config
+            .temporal_patch_size
+            .or(Some(config.vision_config.temporal_patch_size));
+        Ok(())
+    }
     fn supports_paged_attention(&self, _config: &str) -> bool {
         true
     }
@@ -6961,14 +6987,22 @@ impl MultimodalModelLoader for Qwen3_5Loader {
     fn video_frame_sampling(&self, _config: &str) -> crate::VideoFrameSampling {
         QWEN3_VIDEO_SAMPLING
     }
-    fn modalities(&self, _config: &str) -> Result<Modalities> {
+    fn modalities(&self, config: &str) -> Result<Modalities> {
+        let output = if serde_json::from_str::<Qwen3_5Config>(config)?
+            .classification_num_labels()?
+            .is_some()
+        {
+            vec![SupportedModality::Classification]
+        } else {
+            vec![SupportedModality::Text]
+        };
         Ok(Modalities {
             input: vec![
                 SupportedModality::Text,
                 SupportedModality::Vision,
                 SupportedModality::Video,
             ],
-            output: vec![SupportedModality::Text],
+            output,
         })
     }
 }
@@ -6978,12 +7012,14 @@ impl IsqModelLoader for Qwen3_5Loader {
         Ok(vec![
             Regex::new(r"^(language_model\.model|model\.language_model)\.embed_tokens\.weight$")?,
             Regex::new(r"^lm_head\.(weight|bias)$")?,
+            Regex::new(r"^score\.(weight|bias)$")?,
         ])
     }
 
     fn isq_layer_regexes(&self, _config: &str) -> Result<Vec<Regex>> {
         Ok(vec![
             Regex::new(r"lm_head\.(weight|bias)$")?,
+            Regex::new(r"score\.(weight|bias)$")?,
             // Full attention projections
             Regex::new(
                 r"^(language_model\.model|model\.language_model)\.layers\.(\d+)\.self_attn\.q_proj\.(weight|bias)$",
@@ -7112,8 +7148,14 @@ impl DeviceMappedModelLoader for Qwen3_5Loader {
     ) -> Result<usize> {
         let cfg: Qwen3_5Config = serde_json::from_str(config)?;
         let tie = cfg.tie_word_embeddings;
+        let classification_num_labels = cfg.classification_num_labels()?;
         let text_elems = {
             let cfg = &cfg.text_config;
+            let output_head_names = if classification_num_labels.is_some() {
+                &["score.weight"][..]
+            } else {
+                &["lm_head.weight"][..]
+            };
             let (embed_tokens_pack_factor, lm_head_pack_factor) =
                 super::language_model_pack_factors_with_aliases(
                     _quantization,
@@ -7121,19 +7163,21 @@ impl DeviceMappedModelLoader for Qwen3_5Loader {
                         "language_model.model.embed_tokens.weight",
                         "model.language_model.embed_tokens.weight",
                     ],
-                    &["lm_head.weight"],
-                    tie,
+                    output_head_names,
+                    tie && classification_num_labels.is_none(),
                     dtype,
                     weight_pack_factor,
                 )?;
             let embed_tokens = cfg.hidden_size * cfg.vocab_size / embed_tokens_pack_factor;
-            let lm_head = if !tie {
+            let output_head = if let Some(num_labels) = classification_num_labels {
+                cfg.hidden_size * num_labels / lm_head_pack_factor
+            } else if !tie {
                 cfg.hidden_size * cfg.vocab_size / lm_head_pack_factor
             } else {
                 0
             };
             let norm = cfg.hidden_size;
-            embed_tokens + lm_head + norm
+            embed_tokens + output_head + norm
         };
 
         let (patch_merger, deepstack_mergers) = {
@@ -7364,6 +7408,23 @@ impl MultimodalModelLoader for Qwen3_5MoeLoader {
     ) -> Arc<dyn Processor + Send + Sync> {
         Arc::new(Qwen3_5MoeProcessor::new(max_edge))
     }
+    fn finalize_preprocessor_config(
+        &self,
+        model_config: &str,
+        preprocessor_config: &mut PreProcessorConfig,
+    ) -> Result<()> {
+        let config: Qwen3_5MoeConfig = serde_json::from_str(model_config)?;
+        preprocessor_config.patch_size = preprocessor_config
+            .patch_size
+            .or(Some(config.vision_config.patch_size));
+        preprocessor_config.merge_size = preprocessor_config
+            .merge_size
+            .or(Some(config.vision_config.spatial_merge_size));
+        preprocessor_config.temporal_patch_size = preprocessor_config
+            .temporal_patch_size
+            .or(Some(config.vision_config.temporal_patch_size));
+        Ok(())
+    }
     fn supports_paged_attention(&self, _config: &str) -> bool {
         true
     }
@@ -7379,14 +7440,22 @@ impl MultimodalModelLoader for Qwen3_5MoeLoader {
     fn video_frame_sampling(&self, _config: &str) -> crate::VideoFrameSampling {
         QWEN3_VIDEO_SAMPLING
     }
-    fn modalities(&self, _config: &str) -> Result<Modalities> {
+    fn modalities(&self, config: &str) -> Result<Modalities> {
+        let output = if serde_json::from_str::<Qwen3_5MoeConfig>(config)?
+            .classification_num_labels()?
+            .is_some()
+        {
+            vec![SupportedModality::Classification]
+        } else {
+            vec![SupportedModality::Text]
+        };
         Ok(Modalities {
             input: vec![
                 SupportedModality::Text,
                 SupportedModality::Vision,
                 SupportedModality::Video,
             ],
-            output: vec![SupportedModality::Text],
+            output,
         })
     }
 }
@@ -7396,12 +7465,14 @@ impl IsqModelLoader for Qwen3_5MoeLoader {
         Ok(vec![
             Regex::new(r"^(language_model\.model|model\.language_model)\.embed_tokens\.weight$")?,
             Regex::new(r"^lm_head\.(weight|bias)$")?,
+            Regex::new(r"^score\.(weight|bias)$")?,
         ])
     }
 
     fn isq_layer_regexes(&self, _config: &str) -> Result<Vec<Regex>> {
         Ok(vec![
             Regex::new(r"lm_head\.(weight|bias)$")?,
+            Regex::new(r"score\.(weight|bias)$")?,
             // Full attention projections
             Regex::new(
                 r"^(language_model\.model|model\.language_model)\.layers\.(\d+)\.self_attn\.q_proj\.(weight|bias)$",
@@ -7571,8 +7642,14 @@ impl DeviceMappedModelLoader for Qwen3_5MoeLoader {
     ) -> Result<usize> {
         let cfg: Qwen3_5MoeConfig = serde_json::from_str(config)?;
         let tie = cfg.tie_word_embeddings;
+        let classification_num_labels = cfg.classification_num_labels()?;
         let text_elems = {
             let cfg = &cfg.text_config;
+            let output_head_names = if classification_num_labels.is_some() {
+                &["score.weight"][..]
+            } else {
+                &["lm_head.weight"][..]
+            };
             let (embed_tokens_pack_factor, lm_head_pack_factor) =
                 super::language_model_pack_factors_with_aliases(
                     _quantization,
@@ -7580,19 +7657,21 @@ impl DeviceMappedModelLoader for Qwen3_5MoeLoader {
                         "language_model.model.embed_tokens.weight",
                         "model.language_model.embed_tokens.weight",
                     ],
-                    &["lm_head.weight"],
-                    tie,
+                    output_head_names,
+                    tie && classification_num_labels.is_none(),
                     dtype,
                     weight_pack_factor,
                 )?;
             let embed_tokens = cfg.hidden_size * cfg.vocab_size / embed_tokens_pack_factor;
-            let lm_head = if !tie {
+            let output_head = if let Some(num_labels) = classification_num_labels {
+                cfg.hidden_size * num_labels / lm_head_pack_factor
+            } else if !tie {
                 cfg.hidden_size * cfg.vocab_size / lm_head_pack_factor
             } else {
                 0
             };
             let norm = cfg.hidden_size;
-            embed_tokens + lm_head + norm
+            embed_tokens + output_head + norm
         };
 
         let (patch_merger, deepstack_mergers) = {
@@ -10104,6 +10183,102 @@ mod tests {
         assert!(
             MultimodalLoaderType::from_causal_lm_name("VoxtralForConditionalGeneration").is_err()
         );
+    }
+
+    #[test]
+    fn qwen3_5_sequence_classification_uses_multimodal_loader() {
+        assert_eq!(
+            MultimodalLoaderType::from_causal_lm_name("Qwen3_5ForSequenceClassification").unwrap(),
+            MultimodalLoaderType::Qwen3_5
+        );
+    }
+
+    #[test]
+    fn qwen3_5_sequence_classification_reports_modality_and_score_head() -> Result<()> {
+        let config = serde_json::json!({
+            "architectures": ["Qwen3_5ForSequenceClassification"],
+            "text_config": {
+                "head_dim": 64, "vocab_size": 32, "hidden_size": 128, "intermediate_size": 256,
+                "num_hidden_layers": 8, "num_attention_heads": 4, "num_key_value_heads": 2,
+                "hidden_act": "silu", "max_position_embeddings": 1024, "rms_norm_eps": 1e-6,
+                "rope_parameters": { "mrope_section": [8, 4, 4] },
+                "linear_key_head_dim": 16, "linear_value_head_dim": 16,
+                "linear_num_key_heads": 2, "linear_num_value_heads": 4
+            },
+            "vision_config": {
+                "depth": 1, "hidden_size": 64, "hidden_act": "gelu_pytorch_tanh",
+                "intermediate_size": 128, "num_heads": 1, "in_channels": 3,
+                "patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2,
+                "out_hidden_size": 128
+            },
+            "image_token_id": 1, "video_token_id": 2,
+            "vision_start_token_id": 3, "vision_end_token_id": 4,
+            "tie_word_embeddings": true,
+            "num_labels": 3
+        })
+        .to_string();
+        let loader = Qwen3_5Loader;
+
+        assert_eq!(
+            loader.modalities(&config)?.output,
+            vec![SupportedModality::Classification]
+        );
+        for predicates in [
+            loader.promoted_isq_predicates(&config)?,
+            loader.isq_layer_regexes(&config)?,
+        ] {
+            assert!(matches_any(&predicates, "score.weight"));
+        }
+        assert!(!matches_any(
+            &Phi3VLoader.promoted_isq_predicates("")?,
+            "score.weight"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn qwen3_5_moe_sequence_classification_reports_modality_and_score_head() -> Result<()> {
+        let config = serde_json::json!({
+            "architectures": ["Qwen3_5MoeForSequenceClassification"],
+            "text_config": {
+                "head_dim": 64, "vocab_size": 32, "hidden_size": 128,
+                "num_hidden_layers": 8, "num_attention_heads": 4, "num_key_value_heads": 2,
+                "hidden_act": "silu", "max_position_embeddings": 1024, "rms_norm_eps": 1e-6,
+                "rope_parameters": { "mrope_section": [8, 4, 4] },
+                "moe_intermediate_size": 64, "shared_expert_intermediate_size": 64,
+                "num_experts": 4, "num_experts_per_tok": 2,
+                "linear_key_head_dim": 16, "linear_value_head_dim": 16,
+                "linear_num_key_heads": 2, "linear_num_value_heads": 4
+            },
+            "vision_config": {
+                "depth": 1, "hidden_size": 64, "hidden_act": "gelu_pytorch_tanh",
+                "intermediate_size": 128, "num_heads": 1, "in_channels": 3,
+                "patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2,
+                "out_hidden_size": 128
+            },
+            "image_token_id": 1, "video_token_id": 2,
+            "vision_start_token_id": 3, "vision_end_token_id": 4,
+            "tie_word_embeddings": false,
+            "num_labels": 3
+        })
+        .to_string();
+        let loader = Qwen3_5MoeLoader;
+
+        assert_eq!(
+            MultimodalLoaderType::from_causal_lm_name("Qwen3_5MoeForSequenceClassification")?,
+            MultimodalLoaderType::Qwen3_5Moe
+        );
+        assert_eq!(
+            loader.modalities(&config)?.output,
+            vec![SupportedModality::Classification]
+        );
+        for predicates in [
+            loader.promoted_isq_predicates(&config)?,
+            loader.isq_layer_regexes(&config)?,
+        ] {
+            assert!(matches_any(&predicates, "score.weight"));
+        }
+        Ok(())
     }
 
     #[test]

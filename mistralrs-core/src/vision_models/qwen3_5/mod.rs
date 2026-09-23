@@ -59,6 +59,7 @@ pub struct Qwen3_5Model {
     // External DFlash block-diffusion drafter, replacing the built-in MTP head when attached
     pub(super) dflash: Mutex<Option<std::sync::Arc<crate::speculative::DFlashDraftModel>>>,
     pending_prompt_tails: Mutex<std::collections::HashMap<usize, speculative::PendingPromptTail>>,
+    is_sequence_classifier: bool,
 }
 
 impl Qwen3_5Model {
@@ -85,11 +86,13 @@ impl Qwen3_5Model {
         if cfg.quantization_config.is_some() {
             text_config.quantization_config = cfg.quantization_config.clone();
         }
+        let classification_num_labels = cfg.classification_num_labels()?;
         let text = Qwen3_5TextModel::new(
             &text_config,
             vb.clone(),
             cfg.tie_word_embeddings,
             cfg.mtp,
+            classification_num_labels,
             normal_loading_metadata,
             attention_mechanism,
         )?;
@@ -106,6 +109,7 @@ impl Qwen3_5Model {
             draft_lm_head: Mutex::new(None),
             dflash: Mutex::new(None),
             pending_prompt_tails: Mutex::new(std::collections::HashMap::new()),
+            is_sequence_classifier: classification_num_labels.is_some(),
         })
     }
 
@@ -434,7 +438,7 @@ impl crate::block_diffusion::BlockDiffusionMixin for Qwen3_5Model {}
 
 impl MultimodalModel for Qwen3_5Model {
     fn supports_packed_prefill(&self) -> bool {
-        true
+        !self.is_sequence_classifier
     }
 
     fn supports_mixed_media_batches(&self) -> bool {

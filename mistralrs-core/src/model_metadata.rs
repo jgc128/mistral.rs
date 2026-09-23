@@ -478,9 +478,38 @@ The `Architecture` column is the `config.json` `architectures` value. Per-family
 
 "#;
 
+const CLASSIFICATION: &str = r#"## Classification models
+
+| Architecture | Model families | Example |
+|---|---|---|
+| `Qwen3_5ForSequenceClassification` | OpenJEV 0.8B and 4B | <details><summary><code>AlexWortega/openjev</code></summary><code>hf download AlexWortega/openjev --include "qwen3.5-4b-nli-v2/*" --local-dir openjev</code><br><code>mistralrs serve -m openjev/qwen3.5-4b-nli-v2</code></details> |
+| `Qwen3_5MoeForSequenceClassification` | OpenJEV 35B-A3B | <details><summary><code>AlexWortega/openjev</code></summary><code>hf download AlexWortega/openjev --include "qwen3.5-35b-a3b-nli/*" --local-dir openjev</code><br><code>mistralrs serve -m openjev/qwen3.5-35b-a3b-nli</code></details> |
+
+OpenJEV checkpoints are stored in subdirectories of one Hub repository, so download the desired
+checkpoint and serve that local subdirectory. The sequence-classification loader uses
+`score.weight`, pools the last non-padding token, and returns logits in
+`[contradiction, entailment, neutral]` order through `POST /v1/classify`.
+
+```bash
+curl http://localhost:1234/v1/classify \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "default",
+    "input": [{
+      "premise": "A man is playing a guitar.",
+      "hypothesis": "Someone is making music."
+    }]
+  }'
+```
+
+For image classification, set `image` to an HTTP(S) or data URL and put exactly one `{img}`
+marker in `premise`. The server expands that marker to the Qwen3.5 vision tokens.
+
+"#;
+
 const FOOTER: &str = r#"## Format and quantization notes
 
-Text, multimodal, speech, and embedding models support ISQ at load time. Diffusion models (FLUX) do not; they load at native precision. See [GGUF support](/reference/gguf-support/) for GGUF compatibility; availability of [UQFF](/reference/uqff-format/), GPTQ, and AWQ artifacts varies by model on Hugging Face.
+Text, multimodal, classification, speech, and embedding models support ISQ at load time. Diffusion models (FLUX) do not; they load at native precision. See [GGUF support](/reference/gguf-support/) for GGUF compatibility; availability of [UQFF](/reference/uqff-format/), GPTQ, and AWQ artifacts varies by model on Hugging Face.
 
 ## Speculative decoding
 
@@ -560,6 +589,8 @@ pub fn render_supported_models_markdown() -> String {
         &mut md,
         MultimodalLoaderType::iter().map(|t| (t.config_arch().to_string(), t.arch_metadata())),
     );
+
+    md.push_str(CLASSIFICATION);
 
     md.push_str("## Image generation\n\n");
     simple_table(

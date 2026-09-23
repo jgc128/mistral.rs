@@ -636,6 +636,8 @@ impl Loader for MultimodalLoader {
                     &fs::read_to_string(video_config).unwrap(),
                 )?));
             }
+            self.inner
+                .finalize_preprocessor_config(&config, &mut preprocessor_config)?;
             let processor_config: Option<ProcessorConfig> = processor_config_json
                 .as_deref()
                 .map(|json| serde_json::from_str(json).unwrap());
@@ -2989,7 +2991,14 @@ impl Pipeline for MultimodalPipeline {
         .await
     }
     fn category(&self) -> ModelCategory {
-        if matches!(
+        if self
+            .metadata
+            .modalities
+            .output
+            .contains(&crate::SupportedModality::Classification)
+        {
+            ModelCategory::Classification
+        } else if matches!(
             self.metadata.modalities.input.as_slice(),
             [crate::SupportedModality::Text]
         ) {

@@ -238,6 +238,7 @@ pub mod approvals;
 pub mod background_tasks;
 pub mod cached_responses;
 pub mod chat_completion;
+pub mod classification;
 mod completion_core;
 pub mod completions;
 pub mod embeddings;

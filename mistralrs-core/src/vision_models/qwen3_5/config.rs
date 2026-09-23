@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use mistralrs_quant::QuantizedConfig;
 
 use crate::gdn::{GdnStateDType, GdnVHeadLayout};
@@ -433,6 +435,8 @@ impl TextConfig {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub architectures: Vec<String>,
     pub text_config: TextConfig,
     pub vision_config: VisionConfig,
     pub image_token_id: u32,
@@ -442,9 +446,32 @@ pub struct Config {
     pub tie_word_embeddings: bool,
     /// Top-level quantization_config takes precedence
     pub quantization_config: Option<QuantizedConfig>,
+    #[serde(default)]
+    pub num_labels: Option<usize>,
+    #[serde(default)]
+    pub id2label: BTreeMap<String, String>,
     /// Injected by the loader when the built-in MTP head should be loaded (see `MTP_CONFIG_KEY`).
     #[serde(default, rename = "_mistralrs_mtp")]
     pub mtp: bool,
+}
+
+impl Config {
+    pub(crate) fn classification_num_labels(&self) -> candle_core::Result<Option<usize>> {
+        if !self
+            .architectures
+            .iter()
+            .any(|architecture| architecture == "Qwen3_5ForSequenceClassification")
+        {
+            return Ok(None);
+        }
+        let num_labels = self.num_labels.unwrap_or(self.id2label.len());
+        if num_labels == 0 {
+            candle_core::bail!(
+                "Qwen3.5 sequence-classification config must define num_labels or id2label"
+            );
+        }
+        Ok(Some(num_labels))
+    }
 }
 
 #[cfg(test)]
@@ -498,6 +525,38 @@ mod tests {
         assert_eq!(cfg.mtp_layer_idx(), 8);
         assert_eq!(cfg.mtp_layers(true), 1);
         assert_eq!(cfg.mtp_layers(false), 0);
+    }
+
+    #[test]
+    fn sequence_classification_labels_are_inferred_from_id2label() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "architectures": ["Qwen3_5ForSequenceClassification"],
+            "text_config": {
+                "head_dim": 64, "vocab_size": 32, "hidden_size": 128, "intermediate_size": 256,
+                "num_hidden_layers": 8, "num_attention_heads": 4, "num_key_value_heads": 2,
+                "hidden_act": "silu", "max_position_embeddings": 1024, "rms_norm_eps": 1e-6,
+                "rope_parameters": { "mrope_section": [8, 4, 4] },
+                "linear_key_head_dim": 16, "linear_value_head_dim": 16,
+                "linear_num_key_heads": 2, "linear_num_value_heads": 4
+            },
+            "vision_config": {
+                "depth": 1, "hidden_size": 64, "hidden_act": "gelu_pytorch_tanh",
+                "intermediate_size": 128, "num_heads": 1, "in_channels": 3,
+                "patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2,
+                "out_hidden_size": 128
+            },
+            "image_token_id": 1, "video_token_id": 2,
+            "vision_start_token_id": 3, "vision_end_token_id": 4,
+            "tie_word_embeddings": true,
+            "id2label": {
+                "0": "contradiction",
+                "1": "entailment",
+                "2": "neutral"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(config.classification_num_labels().unwrap(), Some(3));
     }
 
     #[test]

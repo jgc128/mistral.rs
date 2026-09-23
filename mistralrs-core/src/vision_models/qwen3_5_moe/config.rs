@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use mistralrs_quant::QuantizedConfig;
 
 use crate::gdn::{GdnStateDType, GdnVHeadLayout};
@@ -219,6 +221,8 @@ impl TextConfig {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub architectures: Vec<String>,
     pub text_config: TextConfig,
     pub vision_config: VisionConfig,
     pub image_token_id: u32,
@@ -228,4 +232,27 @@ pub struct Config {
     pub tie_word_embeddings: bool,
     /// Top-level quantization_config takes precedence
     pub quantization_config: Option<QuantizedConfig>,
+    #[serde(default)]
+    pub num_labels: Option<usize>,
+    #[serde(default)]
+    pub id2label: BTreeMap<String, String>,
+}
+
+impl Config {
+    pub(crate) fn classification_num_labels(&self) -> candle_core::Result<Option<usize>> {
+        if !self
+            .architectures
+            .iter()
+            .any(|architecture| architecture == "Qwen3_5MoeForSequenceClassification")
+        {
+            return Ok(None);
+        }
+        let num_labels = self.num_labels.unwrap_or(self.id2label.len());
+        if num_labels == 0 {
+            candle_core::bail!(
+                "Qwen3.5 MoE sequence-classification config must define num_labels or id2label"
+            );
+        }
+        Ok(Some(num_labels))
+    }
 }

@@ -629,6 +629,9 @@ pub async fn interactive_mode(mistralrs: Arc<MistralRs>, config: InteractiveConf
         Ok(ModelCategory::Embedding) => error!(
             "Embedding models do not support interactive mode. Use the server or Python/Rust APIs."
         ),
+        Ok(ModelCategory::Classification) => error!(
+            "Classification models do not support interactive mode. Use the /v1/classify endpoint."
+        ),
         Err(e) => eprintln!("Error getting model category: {e}"),
     }
 }

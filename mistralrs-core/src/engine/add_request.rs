@@ -191,7 +191,8 @@ impl Engine {
             | RequestMessage::ImageGeneration { .. }
             | RequestMessage::SpeechGeneration { .. }
             | RequestMessage::Embedding { .. }
-            | RequestMessage::EmbeddingTokens { .. } => None,
+            | RequestMessage::EmbeddingTokens { .. }
+            | RequestMessage::Classification { .. } => None,
         };
         let truncate_sequence = request.truncate_sequence;
         if is_chat
@@ -228,6 +229,7 @@ impl Engine {
                 ModelCategory::Embedding,
                 RequestMessage::Embedding { .. } | RequestMessage::EmbeddingTokens { .. },
             ) => (),
+            (ModelCategory::Classification, RequestMessage::Classification { .. }) => (),
             _ => {
                 request
                     .response
@@ -242,6 +244,7 @@ impl Engine {
 
         let images = match request.messages {
             RequestMessage::MultimodalChat { ref images, .. } => Some(images.clone()),
+            RequestMessage::Classification { ref images, .. } => Some(images.clone()),
             _ => None,
         };
 
@@ -289,7 +292,8 @@ impl Engine {
             RequestMessage::ImageGeneration { .. }
             | RequestMessage::SpeechGeneration { .. }
             | RequestMessage::Embedding { .. }
-            | RequestMessage::EmbeddingTokens { .. } => SeqStepType::OneShot,
+            | RequestMessage::EmbeddingTokens { .. }
+            | RequestMessage::Classification { .. } => SeqStepType::OneShot,
             _ => SeqStepType::PromptAndDecode,
         };
 
@@ -353,7 +357,8 @@ impl Engine {
                 }
             }
             RequestMessage::Completion { text, .. }
-            | RequestMessage::Embedding { prompt: text } => {
+            | RequestMessage::Embedding { prompt: text }
+            | RequestMessage::Classification { text, .. } => {
                 let Some(tokenizer) = &get_mut_arcmutex!(self.pipeline).tokenizer() else {
                     request
                         .response
@@ -423,7 +428,10 @@ impl Engine {
 
         if matches!(
             get_mut_arcmutex!(self.pipeline).category(),
-            ModelCategory::Text | ModelCategory::Multimodal { .. } | ModelCategory::Embedding
+            ModelCategory::Text
+                | ModelCategory::Multimodal { .. }
+                | ModelCategory::Embedding
+                | ModelCategory::Classification
         ) && prompt_tokens.len() > get_mut_arcmutex!(self.pipeline).get_metadata().max_seq_len
         {
             // text/vision => truncate from start
@@ -440,7 +448,9 @@ impl Engine {
                 return;
             } else if matches!(
                 category,
-                ModelCategory::Text | ModelCategory::Multimodal { .. }
+                ModelCategory::Text
+                    | ModelCategory::Multimodal { .. }
+                    | ModelCategory::Classification
             ) {
                 let prompt_len = prompt_tokens.len();
                 let max_len = get_mut_arcmutex!(self.pipeline).get_metadata().max_seq_len;
@@ -449,7 +459,9 @@ impl Engine {
                 // Reserve space for generation tokens
                 // If user specified max_len (generation length), reserve that many tokens (capped to max_len)
                 // Otherwise, reserve just 1 token minimum to allow at least some generation
-                let sampling_max = if let Some(sampling_max) = request.sampling_params.max_len {
+                let sampling_max = if matches!(category, ModelCategory::Classification) {
+                    0
+                } else if let Some(sampling_max) = request.sampling_params.max_len {
                     sampling_max.min(max_len)
                 } else {
                     1
@@ -632,7 +644,9 @@ impl Engine {
 
             let seq_preallocated_cache = if matches!(
                 get_mut_arcmutex!(self.pipeline).category(),
-                ModelCategory::Text | ModelCategory::Multimodal { .. }
+                ModelCategory::Text
+                    | ModelCategory::Multimodal { .. }
+                    | ModelCategory::Classification
             ) {
                 let (metadata, device, needs_preallocated_cache) = {
                     let pipeline = get_mut_arcmutex!(self.pipeline);

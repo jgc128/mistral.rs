@@ -1174,6 +1174,7 @@ pub struct Qwen3_5TextModel {
     pub(super) layer_types: Vec<LayerType>,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
     lm_head: Arc<dyn QuantMethod>,
+    is_sequence_classifier: bool,
     pub(super) cache: EitherCache,
     pub(super) cfg: ModelConfigMetadata,
     pub(super) device: Device,
@@ -1198,6 +1199,7 @@ impl Qwen3_5TextModel {
         vb: ShardedVarBuilder,
         tie: bool,
         mtp: bool,
+        classification_num_labels: Option<usize>,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Self> {
@@ -1364,7 +1366,15 @@ impl Qwen3_5TextModel {
             cfg.rms_norm_eps,
             mapper.set_nm_device(vb_m.pp("norm"), false),
         )?;
-        let lm_head = if !tie {
+        let lm_head = if let Some(num_labels) = classification_num_labels {
+            ReplicatedLayer::new(
+                cfg.hidden_size,
+                num_labels,
+                &cfg.quantization_config,
+                false,
+                mapper.set_nm_device(vb.pp("score"), normal_loading_metadata.loading_isq),
+            )?
+        } else if !tie {
             ReplicatedLayer::new(
                 cfg.hidden_size,
                 cfg.vocab_size,
@@ -1420,6 +1430,7 @@ impl Qwen3_5TextModel {
             layers,
             layer_types: layer_types.clone(),
             lm_head,
+            is_sequence_classifier: classification_num_labels.is_some(),
             cache: EitherCache::Hybrid(pipeline_cache),
             max_seq_len: cfg.max_position_embeddings,
             cfg: ModelConfigMetadata {
@@ -2602,7 +2613,11 @@ impl Qwen3_5TextModel {
                     .lock()
                     .expect("spec capture poisoned") = full_capture;
             }
-            let xs = ctx.logits(&xs)?;
+            let xs = if self.is_sequence_classifier {
+                ctx.last_hidden(&xs)?
+            } else {
+                ctx.logits(&xs)?
+            };
             if store_spec {
                 let positions = position_ids.to_device(&self.device)?;
                 let positions = match positions.rank() {

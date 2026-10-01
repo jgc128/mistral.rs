@@ -482,6 +482,26 @@ pub(crate) fn prompt_prefill_workspace(
     {
         candle_core::bail!("invalid prompt prefill workspace dimensions");
     }
+    let capped_lens;
+    let input = match model.prefix_prefill_kv_len_cap() {
+        Some(cap) => {
+            capped_lens = input
+                .full_context_lens
+                .iter()
+                .zip(input.query_lens)
+                .map(|(full, query)| (*full).min(cap.max(*query)))
+                .collect::<Vec<_>>();
+            let max_len = capped_lens.iter().copied().max().unwrap_or(0);
+            PromptPrefillWorkspaceInput {
+                full_context_lens: &capped_lens,
+                max_pages_per_sequence: input
+                    .max_pages_per_sequence
+                    .min(max_len.div_ceil(input.block_size.max(1))),
+                ..input
+            }
+        }
+        None => input,
+    };
     let query_len = input.query_lens[0];
     let query_layout_is_dense = input.query_lens.iter().all(|&len| len == query_len);
     let total_q_tokens = input
@@ -1072,6 +1092,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "cuda", feature = "flash-attn", target_family = "unix"))]
     #[test]
     fn prompt_workspace_falls_back_for_ineligible_known_attention() {
         let model = workspace_model(Some(PrefixPrefillAttentionFeatures::default()));
@@ -1097,7 +1118,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "cuda", target_family = "unix"))]
+    #[cfg(all(feature = "cuda", feature = "flash-attn", target_family = "unix"))]
     #[test]
     fn prompt_workspace_matches_direct_fa3_availability() {
         let model = workspace_model(Some(PrefixPrefillAttentionFeatures::default()));
